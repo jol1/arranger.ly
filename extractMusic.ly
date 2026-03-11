@@ -1,6 +1,6 @@
 \version "2.24.0"
 
-%%%%%%%%%%%%%%%%%%%%%% version Y/M/D = 2022/12/28 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%% version Y/M/D = 2026/03/11 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 % LSR = http://lsr.di.unimi.it/LSR/Item?id=542
 % Last modif. (the last at the end) :
 % - change append! by cons in (make-signature-list)
@@ -17,6 +17,8 @@
 % - \cadenzaOn/Off compatibility
 % - allows \displayLilyMusic to work, using reduce-seq in a music with a \tempo command
 % - \replaceVoltaMusic was buggy for music out of volta structure : Rewriting.
+% - Changed logic to treat breathing events and caesura events as belonging to the
+%   music that comes before it, not the music that comes after it.
 
 #(define (expand-q-chords music); for q chords : see chord-repetition-init.ly
  (expand-repeat-chords! (list 'rhythmic-event) music))
@@ -43,12 +45,17 @@
 #(define (moment-max a b)
     (if (ly:moment<? a b) b a))
 
-#(define (whole-music-inside? begin-music end-music left-range right-range)
+#(define (whole-music-inside? begin-music end-music left-range right-range is-breath)
    (and (moment>=? begin-music left-range)
         (moment>=? right-range end-music )
-        (not (equal? begin-music right-range)))) %% don't take 0-length events
-                             %% (as \override for ex) beginning at right-range
-                             %% (when begin-music = end-music = right-range)
+        ;; don't take 0-length events (as \override for ex) beginning at
+        ;; right-range (when begin-music = end-music = right-range), unless
+        ;; it's a breathing event or a caesura event.
+        (not (and (equal? begin-music right-range)
+                  (not is-breath)))
+        (not (and (equal? end-music left-range)
+                  is-breath))))
+
 #(define (whole-music-outside? begin-music end-music left-range right-range)
    (or (moment>=? left-range end-music)
        (moment>=? begin-music right-range)))
@@ -166,43 +173,44 @@ Moments as <Mom 5/8>, will return (ly:make-duration k dots num den)"
 %%% don't use (ly:music-deep-copy). Use extract-during below, instead.
 #(define (extract-range music from to)
 "Keeps only music beetween `from and `to, `from and `to as moment"
-(let ((begin-pos (*current-moment*))
-      (end-pos (ly:moment-add (*current-moment*) (ly:music-length music))))
+(let* ((begin-pos (*current-moment*))
+       (end-pos (ly:moment-add (*current-moment*) (ly:music-length music)))
+       (name (ly:music-property music 'name))
+       (is-breath (memq name '(BreathingEvent CaesuraEvent))))
  (*current-moment* end-pos) ;for the next music to process
  (cond
-  ((whole-music-inside? begin-pos end-pos from to) music)
+  ((whole-music-inside? begin-pos end-pos from to is-breath) music)
   ((whole-music-outside? begin-pos end-pos from to)(make-music 'Music))
   (else ; from this point, the intervals [begin-pos end-pos][from to] overlap
-    (let((name (ly:music-property music 'name)))
-     (if (and (ly:duration? (ly:music-property music 'duration))
-              (not (eq? name 'TimeScaledMusic))) ; tuplet have a duration now !
-       (begin    ; a NoteEvent, a skip, a rest, a multiRest
-         (set! begin-pos (moment-max begin-pos from))
-         (set! end-pos (moment-min end-pos to))
-         (ly:music-set-property! music 'duration
-            (if (memq name (list 'NoteEvent 'RestEvent))
-              (moment->rhythm (ly:moment-sub end-pos begin-pos))
-              (make-duration-of-length (ly:moment-sub end-pos begin-pos)))))
-                ; for containers of duration evt, or a chord
-       (let ((elts (ly:music-property music 'elements))
-             (elt  (ly:music-property music 'element)))
-          (*current-moment* begin-pos)    ; we go deeper into the same music evt
-          (cond
-            ((string-contains (symbol->string name) "RepeatedMusic")
-               (if (eq? name 'VoltaRepeatedMusic)
-                 (set! music (extract-range (make-sequential-music (cons elt elts)) from to))
-                 (set! music (extract-repeated-music)))) ; other repeated-musics see macros above
-            ((ly:music? elt)(ly:music-set-property! music 'element
-                                          (extract-range elt from to)))
-            ((pair? elts)
-              (let ((new-elts (if (memq name (list 'SimultaneousMusic 'EventChord))
-                      (filter-elts-for-non-sequential-music) ;; see macros
-                      (filter-elts-for-sequential-music))))
-                (if (null? new-elts)
-                  (set! music (make-music 'Music))
-                  (ly:music-set-property! music 'elements new-elts)))))
-          (*current-moment* end-pos))) ; next music evt
-     music)))))
+    (if (and (ly:duration? (ly:music-property music 'duration))
+             (not (eq? name 'TimeScaledMusic))) ; tuplet have a duration now !
+      (begin    ; a NoteEvent, a skip, a rest, a multiRest
+        (set! begin-pos (moment-max begin-pos from))
+        (set! end-pos (moment-min end-pos to))
+        (ly:music-set-property! music 'duration
+           (if (memq name (list 'NoteEvent 'RestEvent))
+             (moment->rhythm (ly:moment-sub end-pos begin-pos))
+             (make-duration-of-length (ly:moment-sub end-pos begin-pos)))))
+               ; for containers of duration evt, or a chord
+      (let ((elts (ly:music-property music 'elements))
+            (elt  (ly:music-property music 'element)))
+         (*current-moment* begin-pos)    ; we go deeper into the same music evt
+         (cond
+           ((string-contains (symbol->string name) "RepeatedMusic")
+              (if (eq? name 'VoltaRepeatedMusic)
+                (set! music (extract-range (make-sequential-music (cons elt elts)) from to))
+                (set! music (extract-repeated-music)))) ; other repeated-musics see macros above
+           ((ly:music? elt)(ly:music-set-property! music 'element
+                                         (extract-range elt from to)))
+           ((pair? elts)
+             (let ((new-elts (if (memq name (list 'SimultaneousMusic 'EventChord))
+                     (filter-elts-for-non-sequential-music) ;; see macros
+                     (filter-elts-for-sequential-music))))
+               (if (null? new-elts)
+                 (set! music (make-music 'Music))
+                 (ly:music-set-property! music 'elements new-elts)))))
+         (*current-moment* end-pos))) ; next music evt
+    music))))
 
 %% Before defining the music-function \extractMusic, we define a helpful
 %% function \upToMeasure, to let the user define the `from and `during
